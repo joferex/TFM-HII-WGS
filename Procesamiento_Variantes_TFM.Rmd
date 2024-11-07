@@ -1,0 +1,612 @@
+
+--------
+Procesamiento de Variantes 
+Priorizadas por Exomiser
+---------
+
+
+1.Cargar Resultados (HII y Control)
+
+```{r}
+
+info_data <- read_tsv("/Volumes/EXTERNAL_USB/TFM/samples/informacion_muestras.tsv")
+
+
+#Escribir la ruta absoluta donde se encuentran todos los archivos tsv  
+tsv_files <- list.files(path = "/Volumes/EXTERNAL_USB/TFM/results/HPO/Estudio_General", 
+                        pattern = "\\.variants\\.tsv$", 
+                        full.names = TRUE, 
+                        recursive = TRUE)
+
+datasets <- lapply(tsv_files, function(file) {
+  read_tsv(file)
+})
+
+```
+
+
+```{r}
+# Asignar los nombres a la lista de datasets
+names(datasets) <- sub("\\..*$", "", basename(tsv_files))
+
+# Definir una función para eliminar las tres últimas letras de la columna ID
+modify_id_column <- function(df) {
+  df %>%
+    mutate(ID = substr(ID, 1, nchar(ID) - 4))  # Eliminar las tres últimas letras de cada valor en ID
+}
+
+# Aplicar la función a cada dataset en la lista
+datasets <- lapply(datasets, modify_id_column)
+```
+
+Separar en dos listas Controles y Afectados
+
+```{r}
+datasets_control<-list()
+datasets_afectados<-list()
+
+nombres_muestras <- names(datasets)
+
+# Recorre cada muestra en el dataframe fenotipos
+for (muestra in info_data$Muestra) {
+  # Verifica si la muestra está en la lista de datasets
+  if (muestra %in% nombres_muestras) {
+    # Obtén el fenotipo asociado con la muestra
+    grupo <- info_data$Grupo[info_data$Muestra == muestra]
+    
+    
+    # Añade el dataset a la lista correspondiente según el fenotipo
+    if (grupo == "Control") {
+      datasets_control[[muestra]] <- datasets[[muestra]]
+    } else if (grupo == "Afectado") {
+      datasets_afectados[[muestra]] <- datasets[[muestra]]
+    }
+  }
+}
+
+```
+```{r}
+# Cargar data.table
+library(data.table)
+
+# Definir la función
+procesar_datasets <- function(datasets) {
+  # Convertir cada dataset en un data.table
+  datasets <- lapply(datasets, as.data.table)
+  
+  # Crear una lista para almacenar la presencia binaria y la información del gen por dataset
+  info_list <- lapply(names(datasets), function(dataset_name) {
+    dt <- datasets[[dataset_name]]
+    
+    # Agrupar y resumir usando data.table
+    dt_resumen <- dt[, .(
+      present = 1,
+      gene_symbol = first(GENE_SYMBOL),
+      entrez_gene_id = first(ENTREZ_GENE_ID),
+      ref = first(REF),
+      alt = first(ALT),
+      funcional_class = first(FUNCTIONAL_CLASS),
+      hgvs = first(HGVS),
+      freq = first(MAX_FREQ),
+      freq_DB = first(MAX_FREQ_SOURCE),
+      patogeneceidad = first(ALL_PATH),
+      exomiser_acmg_classification = first(EXOMISER_ACMG_CLASSIFICATION),
+      clinvar_primary_interpretation = first(CLINVAR_PRIMARY_INTERPRETATION),
+      clinvar_variation_id = first(CLINVAR_VARIATION_ID),
+      rs_id = first(RS_ID)
+    ), by = ID]
+    
+    # Añadir columna con el nombre del dataset
+    dt_resumen[, dataset := dataset_name]
+    
+    return(dt_resumen)
+  })
+  
+  # Combinar la información de todos los datasets
+  all_info <- rbindlist(info_list)
+  
+  # Crear una tabla que cuenta en cuántos datasets únicos aparece cada ID
+  all_ID <- all_info[, .(
+    num_datasets = uniqueN(dataset),
+    datasets = paste(unique(dataset), collapse = ", "),
+    rs_id = first(rs_id),
+    gene_symbol = first(gene_symbol),
+    entrez_gene_id = first(entrez_gene_id),
+    ref = first(ref),
+    alt = first(alt),
+    hgvs = first(hgvs),
+    freq = first(freq),
+    freq_DB = first(freq_DB),
+    funcional_class = first(funcional_class),
+    patogeneceidad = first(patogeneceidad),
+    exomiser_acmg_classification = first(exomiser_acmg_classification),
+    clinvar_primary_interpretation = first(clinvar_primary_interpretation),
+    clinvar_variation_id = first(clinvar_variation_id)
+  ), by = ID]
+  
+  # Devolver el resultado final
+  return(all_ID)
+}
+
+# Uso de la función
+# all_ID_resultado <- procesar_datasets(lista_de_datasets)
+allID_control<-procesar_datasets(datasets_control)
+allID_afectados<-procesar_datasets(datasets_afectados)
+```
+
+
+Añadir la frecuencia en la que aparece cada variante por grupo y eliminar aquellas que aparecen con poca frecuencia en el grupo casos ya que no son relevantes para nuestro estudio (inferior a 20%)
+
+```{r}
+
+
+total_muestras_control<-as.numeric(length(datasets_control))
+total_muestras_casos<-as.numeric(length(datasets_afectados))
+
+# Calcular frecuencias para el grupo control
+HPO_control <- allID_control %>%
+  mutate(frecuencia_control = num_datasets / total_muestras_control)
+HPO_control <- as.data.frame(HPO_control)
+# Renombrar la columna 'num_datasets' a 'conteo_control' en data.table
+setnames(HPO_control, "num_datasets", "conteo_control")
+
+
+# Calcular frecuencias para el grupo casos
+HPO_filtro <- allID_afectados %>%
+  mutate(frecuencia_casos = num_datasets / total_muestras_casos)
+HPO_filtro <- as.data.frame(HPO_filtro)
+# Renombrar la columna 'num_datasets' a 'conteo_control' en data.table
+setnames(HPO_filtro, "num_datasets", "conteo_casos")
+
+# Añadir la columna de frecuencia_control a HPO_filtro
+HPO_filtro <- merge(HPO_filtro, HPO_control[, c("ID", "frecuencia_control")], by = "ID", all.x = TRUE)
+
+# Añadir la columna de frecuencia_casos a HPO_control
+HPO_control <- merge(HPO_control, HPO_filtro[, c("ID", "frecuencia_casos")], by = "ID", all.x = TRUE)
+
+# Reemplazar NA por 0 en las nuevas columnas
+HPO_filtro$frecuencia_control[is.na(HPO_filtro$frecuencia_control)] <- 0
+HPO_control$frecuencia_casos[is.na(HPO_control$frecuencia_casos)] <- 0
+
+
+HPO_filtro <- HPO_filtro %>%
+  filter(frecuencia_control<frecuencia_casos)
+HPO_control <- HPO_control %>%
+  filter(frecuencia_control<frecuencia_casos)
+
+```
+
+
+
+
+Añadir columna que sea la varianza entre los dos grupos en HPO_filtro
+
+```{r}
+HPO_filtro <- HPO_filtro %>%
+  mutate(varianza = (frecuencia_casos - frecuencia_control)^2)
+```
+
+
+```{r}
+#Si difieren en 2 conteos la varianza es de 0,0064 0-2 10-12 
+#Si difieren en 3 conteos la varianza es de 0,0144 0-3 10-13
+#Si difieren en 4 conteos la varianza es de 0,0256 0-4 10-14  freq 0,16
+#Si difieren en 5 conteos la varianza es de 0,04  0 -5 10-15  no lo tiene en cuenta freq 0,2
+#Si difieren en 6 conteos la varianza es de 0,0576 10-16  3-9  
+# Definir umbral de varianza
+umbral_varianza <- 0.1  # Ajusta este valor según tus necesidades
+
+# Filtrar en HPO_filtro #Omitir
+HPO_filtro_filtrado <- HPO_filtro %>%
+  filter(!(frecuencia_casos < 0.20 & frecuencia_control < 0.20) &
+         ((frecuencia_casos - frecuencia_control)^2 > umbral_varianza))
+
+# Filtrar en HPO_control
+HPO_control_filtrado <- HPO_control %>%
+  filter(!(frecuencia_casos < 0.20 & frecuencia_control < 0.20) &
+         ((frecuencia_casos - frecuencia_control)^2 > umbral_varianza))
+
+final_dataset<-HPO_filtro_filtrado
+```
+
+
+
+Realizar Test de fisher
+```{r}
+
+# Supongamos que dataset_combinado es el dataframe resultante de la combinación
+# y tiene las columnas: ID, frecuencia_control, frecuencia_casos
+
+
+
+# Crear dataframe para almacenar resultados
+resultados <- data.frame(ID = character(), p_value = numeric(), stringsAsFactors = FALSE)
+
+# Iterar sobre cada variante y hacer la prueba de Fisher
+for (i in 1:nrow(final_dataset)) {
+  
+  # Número de veces que aparece la variante en el grupo control y casos
+  num_presentes_control <- final_dataset$frecuencia_control[i] * total_muestras_control
+  num_presentes_casos <- final_dataset$frecuencia_casos[i] * total_muestras_casos
+  
+  # Crear tabla de contingencia
+  tabla <- matrix(c(
+    num_presentes_control,                     # Variante presente en el grupo control
+    total_muestras_control - num_presentes_control, # Variante ausente en el grupo control
+    num_presentes_casos,                       # Variante presente en el grupo de casos
+    total_muestras_casos - num_presentes_casos  # Variante ausente en el grupo de casos
+  ), nrow = 2)
+  
+  
+  # Realizar la prueba exacta de Fisher
+  fisher_result <- fisher.test(tabla)
+  
+  # Guardar el p-value y el ID de la variante
+  resultados <- rbind(resultados, data.frame(ID = final_dataset$ID[i], 
+                                             p_value = fisher_result$p.value))
+}
+```
+
+```{r}
+# Hacer el join entre HPO_filtro y resultados usando la columna 'ID'
+dataset_inicial <- final_dataset %>%
+  left_join(resultados, by = "ID")
+```
+
+
+
+
+Eliminación de variantes catalogadas como benignas
+```{r}
+dataset_inicial_step1 <- dataset_inicial[!(dataset_inicial$exomiser_acmg_classification %in% c("BENIGN", "LIKELY_BENIGN", "BENIGN_OR_LIKELY_BENIGN") |
+                         dataset_inicial$clinvar_primary_interpretation %in% c("BENIGN", "LIKELY_BENIGN", "BENIGN_OR_LIKELY_BENIGN")), ]
+dataset_inicial_step2 <- dataset_inicial_step1[!(dataset_inicial_step1$funcional_class %in% c("intergenic_variant", "synonymous_variant")),]
+
+```
+
+Eliminación de variantes intergénicas y sinónimas
+
+```{r}
+dataset_inicial_step2 <- dataset_inicial_step1[!(dataset_inicial_step1$funcional_class %in% c("intergenic_variant", "synonymous_variant")),]
+```
+
+Crear dos dataset uno para variantes exónicas y otro para variantes no codificantes 
+
+
+```{r}
+exon_data<- dataset_inicial_step2[dataset_inicial_step2$funcional_class %in% c("frameshift_truncation", "frameshift_variant", 
+                                                                    "missense_variant", "stop_gained", "stop_lost", "disruptive_inframe_insertion", 
+                                                                    "disruptive_inframe_deletion",  
+                                                                    "frameshift_elongation", "start_lost", "inframe_insertion", "inframe_deletion"), ]
+
+exon_data_raras <- exon_data %>%
+  filter(freq < 1 )
+
+```
+
+Ajuste de p-value
+```{r}
+exon_data$p_value_fhiser_ajustado<-p.adjust(exon_data$p_value, method = "holm")
+exon_data_raras$p_value_fhiser_ajustado<-p.adjust(exon_data_raras$p_value, method = "holm")
+
+```
+
+
+```{r}
+intron_data<- dataset_inicial_step2[dataset_inicial_step2$funcional_class %in% c("3_prime_UTR_exon_variant", "splice_region_variant", "splice_donor_variant", "splice_acceptor_variant",
+                                                                    "3_prime_UTR_intron_variant", 
+                                                                    "5_prime_UTR_exon_variant", 
+                                                                    "5_prime_UTR_intron_variant", 
+                                                                    "coding_transcript_intron_variant", 
+                                                                    "downstream_gene_variant", 
+                                                                    "regulatory_region_variant",                                                                                                        "upstream_gene_variant"), ]
+intron_data_raras <- intron_data %>%
+  filter(freq < 1)
+
+
+```
+
+intron_data_raras <- intron_data %>%
+  filter(freq < 1 | is.na(freq))
+
+```{r}
+intron_data$p_value_fhiser_ajustado<-p.adjust(intron_data$p_value, method = "holm")
+intron_data_raras$p_value_fhiser_ajustado<-p.adjust(intron_data_raras$p_value, method = "holm")
+
+```
+
+
+Filtrar y quedarnos con las estadisticamente significativas
+```{r}
+intron_data_raras_filtradas <- intron_data_raras %>%
+  filter(p_value_fhiser_ajustado < 0.05)
+intron_data_filtradas <- intron_data %>%
+  filter(p_value_fhiser_ajustado < 0.05)
+```
+
+Filtrar y quedarnos con las estadisticamente significativas
+```{r}
+exon_data_raras_filtradas <- exon_data_raras %>%
+  filter(p_value_fhiser_ajustado < 0.1)
+exon_data_filtradas <- exon_data %>%
+  filter(p_value_fhiser_ajustado < 0.1)
+```
+
+
+
+
+2.Estudio de AQP y GWAS general
+
+```{r}
+library(readr)
+
+info_data <- read_tsv("/Volumes/EXTERNAL_USB/TFM/samples/informacion_muestras.tsv")
+
+
+#Escribir la ruta absoluta donde se encuentran todos los archivos tsv en la variable path 
+tsv_files <- list.files(path = "/Volumes/EXTERNAL_USB/TFM/results/Panel/GWAS2", 
+                        pattern = "\\.variants\\.tsv$", 
+                        full.names = TRUE, 
+                        recursive = TRUE)
+
+datasets <- lapply(tsv_files, function(file) {
+  read_tsv(file)
+})
+
+```
+```{r}
+# Asignar los nombres a la lista de datasets
+names(datasets) <- sub("\\..*$", "", basename(tsv_files))
+
+# Definir una función para eliminar las tres últimas letras de la columna ID
+modify_id_column <- function(df) {
+  df %>%
+    mutate(ID = substr(ID, 1, nchar(ID) - 4))  # Eliminar las tres últimas letras de cada valor en ID
+}
+
+# Aplicar la función a cada dataset en la lista
+datasets <- lapply(datasets, modify_id_column)
+```
+
+Separar en dos listas Controles y Afectados
+
+```{r}
+datasets_control<-list()
+datasets_afectados<-list()
+
+nombres_muestras <- names(datasets)
+
+# Recorre cada muestra en el dataframe fenotipos
+for (muestra in info_data$Muestra) {
+  # Verifica si la muestra está en la lista de datasets
+  if (muestra %in% nombres_muestras) {
+    # Obtén el fenotipo asociado con la muestra
+    grupo <- info_data$Grupo[info_data$Muestra == muestra]
+    
+    
+    # Añade el dataset a la lista correspondiente según el fenotipo
+    if (grupo == "Control") {
+      datasets_control[[muestra]] <- datasets[[muestra]]
+    } else if (grupo == "Afectado") {
+      datasets_afectados[[muestra]] <- datasets[[muestra]]
+    }
+  }
+}
+
+```
+```{r}
+# Cargar data.table
+library(data.table)
+
+# Definir la función
+procesar_datasets <- function(datasets) {
+  # Convertir cada dataset en un data.table
+  datasets <- lapply(datasets, as.data.table)
+  
+  # Crear una lista para almacenar la presencia binaria y la información del gen por dataset
+  info_list <- lapply(names(datasets), function(dataset_name) {
+    dt <- datasets[[dataset_name]]
+    
+    # Agrupar y resumir usando data.table
+    dt_resumen <- dt[, .(
+      present = 1,
+      gene_symbol = first(GENE_SYMBOL),
+      entrez_gene_id = first(ENTREZ_GENE_ID),
+      ref = first(REF),
+      alt = first(ALT),
+      funcional_class = first(FUNCTIONAL_CLASS),
+      hgvs = first(HGVS),
+      freq = first(MAX_FREQ),
+      freq_DB = first(MAX_FREQ_SOURCE),
+      patogeneceidad = first(ALL_PATH),
+      exomiser_acmg_classification = first(EXOMISER_ACMG_CLASSIFICATION),
+      clinvar_primary_interpretation = first(CLINVAR_PRIMARY_INTERPRETATION),
+      clinvar_variation_id = first(CLINVAR_VARIATION_ID),
+      rs_id = first(RS_ID)
+    ), by = ID]
+    
+    # Añadir columna con el nombre del dataset
+    dt_resumen[, dataset := dataset_name]
+    
+    return(dt_resumen)
+  })
+  
+  # Combinar la información de todos los datasets
+  all_info <- rbindlist(info_list)
+  
+  # Crear una tabla que cuenta en cuántos datasets únicos aparece cada ID
+  all_ID <- all_info[, .(
+    num_datasets = uniqueN(dataset),
+    datasets = paste(unique(dataset), collapse = ", "),
+    rs_id = first(rs_id),
+    gene_symbol = first(gene_symbol),
+    entrez_gene_id = first(entrez_gene_id),
+    ref = first(ref),
+    alt = first(alt),
+    hgvs = first(hgvs),
+    freq = first(freq),
+    freq_DB = first(freq_DB),
+    funcional_class = first(funcional_class),
+    patogeneceidad = first(patogeneceidad),
+    exomiser_acmg_classification = first(exomiser_acmg_classification),
+    clinvar_primary_interpretation = first(clinvar_primary_interpretation),
+    clinvar_variation_id = first(clinvar_variation_id)
+  ), by = ID]
+  
+  # Devolver el resultado final
+  return(all_ID)
+}
+
+# Uso de la función
+# all_ID_resultado <- procesar_datasets(lista_de_datasets)
+allID_control<-procesar_datasets(datasets_control)
+allID_afectados<-procesar_datasets(datasets_afectados)
+```
+
+
+
+#Creamos listas con los ID y rs de interés 
+```{r}
+rsIDs_AQP <- c("rs3763040", "rs2075575", "rs3763043", "rs1049305", "rs10244884", "rs2183589")
+
+
+rsIDs_GWAS <- c("rs12134151", "rs11883667", "rs2234671", "rs55652507", "rs185197019", 
+           "rs79060400", "rs35342385", "rs200288366", "rs78550087", "rs9578751", 
+           "rs1007175", "rs4899973", "rs4778107", "rs12945036", "rs79642714")
+
+IDs_GWAS <- c("1-95736887-G-C", "2-105933971-T-A","2-105933971-T-C","2-105933971-T-G", "2-218164385-C-G", "5-155502654-A-C", "8-72537054-G-A", 
+           "11-56701218-C-T", "11-98135040-C-G","11-98135040-C-A", "12-82669637-A-G", "13-24500352-C-T", 
+           "13-96960285-C-T", "14-89272011-T-C", "15-93130510-C-G", "17-230930-C-G", "6-17605974-G-A", "6-17605974-G-T")
+
+rsIDs_GWAS2<-c("rs775238614", "rs141496860", "rs146069306", "rs529730429", "rs200220130", 
+           "rs546029958", "rs148498055", "rs377424288", "rs200588575", "rs73766964", 
+           "rs567226732", "rs121908162", "rs140545796", "rs188199560", "rs573651175")
+
+total_muestras_control<-25
+total_muestras_casos<-25
+```
+
+
+```{r}
+library(dplyr)
+
+filtrar_datasets <- function(dataset) {
+  # Filtrar por rsIDs de AQP y agregar columna de origen
+  AQP_matching_rsIDs <- dataset %>%
+    filter(rs_id %in% rsIDs_AQP) %>%
+    mutate(source = "AQP")
+  
+  # Filtrar por rsIDs de GWAS y agregar columna de origen
+  GWAS_matching_rsIDs <- dataset %>%
+    filter(rs_id %in% rsIDs_GWAS) %>%
+    mutate(source = "GWAS")
+  
+   # Filtrar por rsIDs de GWAS2 y agregar columna de origen
+  GWAS2_matching_rsIDs <- dataset %>%
+    filter(rs_id %in% rsIDs_GWAS2) %>%
+    mutate(source = "GWAS2")
+
+  
+  # Combinar ambos datasets en uno solo
+  combined_results <- bind_rows(AQP_matching_rsIDs, GWAS_matching_rsIDs, GWAS2_matching_rsIDs)
+  
+  # Retornar el dataset combinado
+  return(combined_results)
+}
+
+# Aplicar la función a cada dataset en resultados_familias
+resultados_control <- filtrar_datasets(allID_control)
+resultados_afectados <- filtrar_datasets(allID_afectados)
+
+
+
+
+
+```
+
+
+```{r}
+# Calcular frecuencias para el grupo control
+resultados_control <- resultados_control %>%
+  mutate(frecuencia_control = num_datasets / total_muestras_control)
+resultados_control <- as.data.frame(resultados_control)
+# Renombrar la columna 'num_datasets' a 'conteo_control' en data.table
+setnames(resultados_control, "num_datasets", "conteo_control")
+
+
+```
+
+```{r}
+# Calcular frecuencias para el grupo afectados
+resultados_afectados <- resultados_afectados %>%
+  mutate(frecuencia_afectados = num_datasets / total_muestras_afectados)
+resultados_afectados <- as.data.frame(resultados_afectados)
+# Renombrar la columna 'num_datasets' a 'conteo_control' en data.table
+setnames(resultados_afectados, "num_datasets", "conteo_afectados")
+```
+
+```{r}
+resultado_combinado <- left_join(resultados_afectados, resultados_control, by = "ID")
+ #Reemplazar los NAs en frecuencia_afectados por 0 si algún ID no coincide
+resultado_combinado <- resultado_combinado %>%
+  mutate(frecuencia_afectados = ifelse(is.na(frecuencia_afectados), 0, frecuencia_afectados))
+
+# Asegurarse de que sea un data.frame o tibble
+resultado_combinado <- as.data.frame(resultado_combinado)
+
+library(dplyr)
+
+# Convertir a tibble
+resultado_combinado <- as_tibble(resultado_combinado)
+
+resultado_combinado <- resultado_combinado %>%
+  dplyr::select(-dplyr::ends_with(".x")) %>%
+  dplyr::rename_with(~ gsub("\\.y$", "", .), dplyr::ends_with(".y"))
+
+
+
+
+```
+
+```{r}
+
+final_dataset<-resultado_combinado
+# Supongamos que dataset_combinado es el dataframe resultante de la combinación
+# y tiene las columnas: ID, frecuencia_control, frecuencia_casos
+
+
+
+# Crear dataframe para almacenar resultados
+resultados <- data.frame(ID = character(), p_value = numeric(), stringsAsFactors = FALSE)
+
+# Iterar sobre cada variante y hacer la prueba de Fisher
+for (i in 1:nrow(final_dataset)) {
+  
+  # Número de veces que aparece la variante en el grupo control y casos
+  num_presentes_control <- final_dataset$frecuencia_control[i] * total_muestras_control
+  num_presentes_casos <- final_dataset$frecuencia_afectados[i] * total_muestras_casos
+  
+  # Crear tabla de contingencia
+  tabla <- matrix(c(
+    num_presentes_control,                     # Variante presente en el grupo control
+    total_muestras_control - num_presentes_control, # Variante ausente en el grupo control
+    num_presentes_casos,                       # Variante presente en el grupo de casos
+    total_muestras_casos - num_presentes_casos  # Variante ausente en el grupo de casos
+  ), nrow = 2)
+  
+  
+  # Realizar la prueba exacta de Fisher
+  fisher_result <- fisher.test(tabla)
+  
+  # Guardar el p-value y el ID de la variante
+  resultados <- rbind(resultados, data.frame(ID = final_dataset$ID[i], 
+                                             p_value = fisher_result$p.value))
+}
+```
+
+```{r}
+# Hacer el join entre HPO_filtro y resultados usando la columna 'ID'
+final_dataset <- final_dataset %>%
+  left_join(resultados, by = "ID")
+```
+
